@@ -1,0 +1,92 @@
+# =============================================================================
+# .dockerignore — Reduces Docker build context for Railway deployment
+# This file does NOT delete anything from the project.
+# It only tells Docker which files to skip when building the image.
+# =============================================================================
+
+# --- Python virtual environment ---
+venv/
+
+# --- Python caches ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Frontend build artifacts (rebuilt inside Docker) ---
+frontend/node_modules/
+frontend/.next/
+
+# --- Git metadata ---
+.git/
+.gitignore
+.gitattributes
+
+# --- IDE / editor ---
+.vscode/
+*.swp
+*.swo
+
+# --- Environment files (set via Railway dashboard) ---
+.env
+
+# --- SQLite databases (production uses PostgreSQL) ---
+*.db
+
+# --- Docker files (not needed inside the image) ---
+docker-compose.yml
+frontend/Dockerfile
+
+# --- Documentation ---
+README.md
+LICENSE
+AGENTS.md
+CLAUDE.md
+frontend/AGENTS.md
+frontend/CLAUDE.md
+frontend/README.md
+
+# =============================================================================
+# ML Training Artifacts — NOT needed at runtime
+# The backend only loads: best.pt, soil_final_model.h5, crop_disease_model.h5
+# =============================================================================
+
+# --- Pest_Detection training/dev artifacts ---
+models/Pest_Detection/runs/
+models/Pest_Detection/datasets/
+models/Pest_Detection/outputs/
+models/Pest_Detection/templates/
+models/Pest_Detection/uploads/
+models/Pest_Detection/train.ipynb
+models/Pest_Detection/app.py
+models/Pest_Detection/image_detect.py
+models/Pest_Detection/video_detect.py
+models/Pest_Detection/real_time_detect.py
+models/Pest_Detection/requirements.txt
+models/Pest_Detection/README.md
+models/Pest_Detection/.gitignore
+models/Pest_Detection/result.mp4
+models/Pest_Detection/test_video.mp4
+models/Pest_Detection/test_image.jpg
+models/Pest_Detection/download.jpg
+models/Pest_Detection/image_result.jpg
+models/Pest_Detection/*.webp
+models/Pest_Detection/yolov8n.pt
+
+# --- Soil_Detection training/dev artifacts ---
+models/Soil_Detection/Deployment.py
+models/Soil_Detection/Soil_Type_Detection.ipynb
+models/Soil_Detection/*.jpg
+models/Soil_Detection/*.JPG
+models/Soil_Detection/*.png
+
+# --- Crop_Disease training/dev artifacts ---
+models/Crop_Disease/Deployment.py
+models/Crop_Disease/Crop_Disease_training.ipynb
+models/Crop_Disease/*.JPG
+models/Crop_Disease/*.jpg
+models/Crop_Disease/*.png
+models/Crop_Disease/*.lnk
+
+# --- Misc ---
+instance/
