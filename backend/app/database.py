@@ -16,7 +16,7 @@ Base = declarative_base()
 
 def use_sqlite_fallback():
     global engine, AsyncSessionLocal
-    sqlite_url = "sqlite+aiosqlite:///./krishiai.db"
+    sqlite_url = "sqlite+aiosqlite:///../krishi.db"
     print(f"WARNING: Database connection failed. Switching to local SQLite database: {sqlite_url}", file=sys.stderr, flush=True)
     engine = create_async_engine(sqlite_url, echo=True)
     AsyncSessionLocal.configure(bind=engine)

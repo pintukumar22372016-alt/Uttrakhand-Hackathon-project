@@ -9,10 +9,16 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 load_dotenv()
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+    HAS_GENAI = True
+except Exception:
+    genai = None
+    HAS_GENAI = False
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+import requests
 
 # Configure basic logging
 logging.basicConfig(
@@ -20,6 +26,16 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Ensure upload directory exists
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, 'static', 'uploads', 'ai_images')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+from backend.utils.image_validation import validate_image_for_mode
+from backend.services.crop_disease_service import predict_crop_disease
+from backend.services.pest_detection_service import predict_pest
+from backend.services.soil_analysis_service import predict_soil
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'super_secret_krishi_key_2026'
@@ -31,9 +47,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 login_manager.login_message_category = 'info'
 
-# ==========================================
 # Database Models
-# ==========================================
 class Farmer(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     farmer_id = db.Column(db.String(20), unique=True, nullable=False)
@@ -92,9 +106,6 @@ def load_user(user_id):
 with app.app_context():
     db.create_all()
 
-# ==========================================
-# Error Handlers
-# ==========================================
 @app.errorhandler(404)
 def page_not_found(e):
     logger.warning(f"Page not found: {e}")
@@ -105,9 +116,49 @@ def internal_server_error(e):
     logger.error(f"Internal server error: {e}")
     return "<h1>500 - Internal Server Error</h1>", 500
 
-# ==========================================
-# Authentication Routes
-# ==========================================
+def _analyze_image_with_gemini(crop, symptoms, image_file, mode='disease'):
+    """Call Gemini to analyze a crop image for disease or pest detection."""
+    try:
+        import json, re
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not set")
+            return None
+        if not HAS_GENAI:
+            logger.warning("google-generativeai not available")
+            return None
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+
+        if mode == 'pest':
+            prompt = f"""You are an agricultural pest detection expert. Analyze the uploaded crop image for pest infestation.
+Crop: {crop}. User observed: {symptoms or 'None reported'}.
+Return ONLY a valid JSON object (no markdown, no extra text) in this exact structure:
+{{"disease": "Pest name in Hindi (English name)", "crop": "{crop}", "confidence": 87, "severity": "High", "cause": "Description of pest behavior and damage symptoms", "treatment": ["Control measure 1", "Control measure 2", "Control measure 3"], "prevention": "Prevention strategy"}}"""
+        else:
+            prompt = f"""You are an expert plant pathologist. Analyze the uploaded crop image.
+Crop: {crop}. Symptoms: {symptoms or 'Not specified'}.
+Return ONLY a valid JSON object (no markdown, no extra text) in this exact structure:
+{{"disease": "Disease name in Hindi (English name)", "crop": "{crop}", "confidence": 92, "severity": "Medium", "cause": "Cause of the disease", "treatment": ["Treatment step 1", "Treatment step 2", "Treatment step 3"], "prevention": "Prevention measures"}}"""
+
+        contents = [prompt]
+        if image_file and image_file.filename:
+            image_bytes = image_file.read()
+            if image_bytes:
+                mime = image_file.content_type or 'image/jpeg'
+                contents = [{'mime_type': mime, 'data': image_bytes}, prompt]
+
+        response = model.generate_content(contents)
+        text = response.text.strip()
+        # Extract JSON from markdown code blocks if present
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group())
+            return data
+    except Exception as e:
+        logger.error(f"Gemini analysis error: {e}")
+    return None
+
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if current_user.is_authenticated:
@@ -178,13 +229,13 @@ def logout():
     flash('You have been logged out.', 'info')
     return redirect(url_for('login'))
 
-# ==========================================
+
 # Core Routes
-# ==========================================
+
 @app.route('/')
 def index():
     if current_user.is_authenticated:
-        return redirect(url_for('home'))
+        return redirect(url_for('dashboard'))
     return redirect(url_for('login'))
 
 @app.route('/home')
@@ -199,23 +250,197 @@ def dashboard():
     logger.info("Accessed Dashboard page")
     return render_template('dashboard.html')
 
-@app.route('/disease')
+@app.route('/disease', methods=['GET', 'POST'])
 @login_required
 def disease():
     logger.info("Accessed Disease page")
-    return render_template('disease.html')
+    result = None
+    if request.method == 'POST':
+        crop = request.form.get('crop', '')
+        symptoms = request.form.get('symptoms', '')
+        image_file = request.files.get('image')
+        
+        if not image_file or image_file.filename == '':
+            flash('Please upload an image.', 'danger')
+            return redirect(request.url)
+            
+        filename = secure_filename(f"{uuid.uuid4().hex}_{image_file.filename}")
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        image_file.save(filepath)
+        
+        try:
+            is_valid, error_msg = validate_image_for_mode(filepath, mode='disease')
+            if not is_valid:
+                os.remove(filepath)
+                flash(error_msg, 'danger')
+                return redirect(request.url)
+                
+            result = predict_crop_disease(filepath, user_crop="")
+            if "error" in result:
+                os.remove(filepath)
+                flash(result["error"], 'danger')
+                result = None
+            else:
+                result['uploaded_image_url'] = url_for('static', filename=f'uploads/ai_images/{filename}')
+        except Exception as e:
+            if os.path.exists(filepath): os.remove(filepath)
+            flash(f"Error processing image: {e}", 'danger')
+            result = None
+                
+    return render_template('disease.html', result=result)
 
-@app.route('/soil')
+@app.route('/soil', methods=['GET', 'POST'])
 @login_required
 def soil():
     logger.info("Accessed Soil page")
-    return render_template('soil.html')
+    result = None
+    if request.method == 'POST':
+        location = request.form.get('location', '')
+        image_file = request.files.get('image')
+        
+        if not image_file or image_file.filename == '':
+            flash('Please upload an image.', 'danger')
+            return redirect(request.url)
+            
+        filename = secure_filename(f"{uuid.uuid4().hex}_{image_file.filename}")
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        image_file.save(filepath)
+        
+        try:
+            is_valid, error_msg = validate_image_for_mode(filepath, mode='soil')
+            if not is_valid:
+                os.remove(filepath)
+                flash(error_msg, 'danger')
+                return redirect(request.url)
+                
+            result = predict_soil(filepath)
+            if "error" in result:
+                os.remove(filepath)
+                flash(result["error"], 'danger')
+                result = None
+            else:
+                result['uploaded_image_url'] = url_for('static', filename=f'uploads/ai_images/{filename}')
+        except Exception as e:
+            if os.path.exists(filepath): os.remove(filepath)
+            flash(f"Error processing image: {e}", 'danger')
+            result = None
+                
+    return render_template('soil.html', result=result)
 
-@app.route('/weather')
+import requests
+from datetime import datetime
+
+@app.route('/weather', methods=['GET', 'POST'])
 @login_required
 def weather():
     logger.info("Accessed Weather page")
-    return render_template('weather.html')
+    weather_data = None
+    location_query = ""
+
+    if request.method == 'POST':
+        location_query = request.form.get('location', '').strip()
+        if location_query:
+            weather_data = fetch_weather_data(location_query)
+            if not weather_data:
+                flash(f"'{location_query}' के लिए मौसम की जानकारी नहीं मिली।", 'danger')
+
+    return render_template('weather.html', weather=weather_data, location=location_query)
+
+@app.route('/weather/auto')
+@login_required
+def weather_auto():
+    lat = request.args.get('lat')
+    lon = request.args.get('lon')
+    if lat and lon:
+        try:
+            url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=10"
+            res = requests.get(url, headers={'User-Agent': 'KrishiAI/1.0'}).json()
+            if 'address' in res:
+                city = res['address'].get('city') or res['address'].get('state_district') or res['address'].get('county') or res['address'].get('state')
+                if city:
+                    return jsonify({'city': city})
+        except Exception as e:
+            logger.error(f"Auto location error: {e}")
+    return jsonify({'city': ''})
+
+def fetch_weather_data(city_name):
+    try:
+        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_name}&count=1"
+        geo_res = requests.get(geo_url).json()
+        if not geo_res.get('results'):
+            return None
+        
+        loc = geo_res['results'][0]
+        lat, lon = loc['latitude'], loc['longitude']
+        display_name = loc['name']
+
+        weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,dew_point_2m,surface_pressure,wind_speed_10m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset,uv_index_max&timezone=auto"
+        weather_res = requests.get(weather_url).json()
+
+        def map_condition(code):
+            if code in [0, 1]: return "Clear"
+            if code in [2, 3]: return "Cloudy"
+            if code in [45, 48]: return "Fog"
+            if code in [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]: return "Rain"
+            if code in [95, 96, 99]: return "Storm"
+            return "Clear"
+
+        current = weather_res['current']
+        daily = weather_res['daily']
+
+        forecast = []
+        days_hi = ["सोमवार", "मंगलवार", "बुधवार", "गुरुवार", "शुक्रवार", "शनिवार", "रविवार"]
+        
+        for i in range(7):
+            date_str = daily['time'][i]
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            if i == 0: day_name = "आज"
+            elif i == 1: day_name = "कल"
+            else: day_name = days_hi[date_obj.weekday()]
+
+            forecast.append({
+                'day': day_name,
+                'condition': map_condition(daily['weather_code'][i]),
+                'high': round(daily['temperature_2m_max'][i]),
+                'low': round(daily['temperature_2m_min'][i]),
+                'rain_chance': daily.get('precipitation_probability_max', [0]*7)[i]
+            })
+
+        current_cond = map_condition(current['weather_code'])
+        tips = []
+        if current_cond == "Rain":
+            tips.append({'type': 'danger', 'text': '🌧️ भारी बारिश की संभावना है - अपनी फसल कटाई रोकें और भीगने से बचाएं।'})
+            tips.append({'type': 'warning', 'text': '💧 खेतों में अतिरिक्त पानी निकासी का प्रबंध करें, सिंचाई तुरंत बंद करें।'})
+        elif current_cond == "Storm":
+            tips.append({'type': 'danger', 'text': '⚡ तूफान की संभावना है - खेतों में जाने से बचें।'})
+        elif current['temperature_2m'] > 35:
+            tips.append({'type': 'warning', 'text': '🌡️ तापमान बहुत अधिक है - फसलों में हल्की सिंचाई करें।'})
+        else:
+            tips.append({'type': 'safe', 'text': '✅ मौसम साफ है, आप खेती के सभी कार्य कर सकते हैं।'})
+
+        sunrise_time = datetime.strptime(daily['sunrise'][0], "%Y-%m-%dT%H:%M").strftime("%I:%M %p") if 'sunrise' in daily else ""
+        sunset_time = datetime.strptime(daily['sunset'][0], "%Y-%m-%dT%H:%M").strftime("%I:%M %p") if 'sunset' in daily else ""
+
+        return {
+            'location': display_name,
+            'date': datetime.now().strftime("%d %B %Y"),
+            'condition': current_cond,
+            'temp': round(current['temperature_2m']),
+            'feels_like': round(current.get('apparent_temperature', current['temperature_2m'])),
+            'dew_point': round(current.get('dew_point_2m', 0)),
+            'humidity': current['relative_humidity_2m'],
+            'wind_speed': current['wind_speed_10m'],
+            'pressure': current['surface_pressure'],
+            'visibility': 10,
+            'uv_index': round(daily.get('uv_index_max', [0])[0], 1),
+            'sunrise': sunrise_time,
+            'sunset': sunset_time,
+            'forecast': forecast,
+            'farming_tips': tips
+        }
+    except Exception as e:
+        logger.error(f"Weather fetch error: {e}")
+        return None
 
 @app.route('/chatbot')
 @login_required
@@ -281,33 +506,93 @@ def chatbot_query():
     db.session.add(user_msg)
     db.session.commit()
     
-    try:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if api_key:
-            genai.configure(api_key=api_key)
-        else:
-            logger.warning("GEMINI_API_KEY not found in environment variables.")
+    # --- AI Response Logic ---
+    system_prompt = "You are Krishi AI, an AI assistant for Indian farmers. You were created by the 'Quanta Byte' team. If anyone asks who created you, who made you, or anything similar (like 'tumhe kisne banaya hai'), you must reply that you were created by the Quanta Byte team. Answer the following question helpfully and concisely in the language it was asked (mostly Hindi or English). Focus on agriculture, weather, crops, market prices, and government schemes. Keep answers brief (2-4 sentences max) and do not use markdown except for basic bolding."
+    ai_response = None
+    
+    # Try Gemini first
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key and gemini_key != "your_gemini_api_key_here" and HAS_GENAI:
+        try:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            prompt = f"{system_prompt}\nQuestion: {message}"
             
-        model = genai.GenerativeModel('gemini-3.5-flash')
-        prompt = f"You are Krishi AI, an AI assistant for Indian farmers. Answer the following question helpfully and concisely in the language it was asked (mostly Hindi or English). Focus on agriculture, weather, crops, market prices, and government schemes. Keep answers brief (2-4 sentences max) and do not use markdown except for basic bolding. Question: {message}"
-        
-        contents = []
-        if image_data:
+            contents = []
+            if image_data:
+                try:
+                    mime_type, base64_data = image_data.split(';base64,')
+                    mime_type = mime_type.replace('data:', '')
+                    image_bytes = base64.b64decode(base64_data)
+                    contents.append({'mime_type': mime_type, 'data': image_bytes})
+                except Exception as e:
+                    logger.error(f"Error decoding image data: {e}")
+            contents.append(prompt)
+            
+            response = model.generate_content(contents)
+            ai_response = response.text
+            logger.info("Chatbot response via Gemini API")
+        except Exception as e:
+            logger.error(f"Gemini API Error: {e}")
+    
+    # Fallback to Groq API (free Llama model)
+    if not ai_response:
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+        if groq_key and groq_key != "your_groq_api_key_here":
             try:
-                mime_type, base64_data = image_data.split(';base64,')
-                mime_type = mime_type.replace('data:', '')
-                image_bytes = base64.b64decode(base64_data)
-                contents.append({'mime_type': mime_type, 'data': image_bytes})
+                groq_resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {groq_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": message or "Analyze the uploaded image."}
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 500
+                    },
+                    timeout=30
+                )
+                if groq_resp.status_code == 200:
+                    groq_data = groq_resp.json()
+                    ai_response = groq_data['choices'][0]['message']['content']
+                    logger.info("Chatbot response via Groq API")
+                else:
+                    logger.error(f"Groq API Error: {groq_resp.status_code} - {groq_resp.text}")
             except Exception as e:
-                logger.error(f"Error decoding image data: {e}")
-                
-        contents.append(prompt)
-        
-        response = model.generate_content(contents)
-        ai_response = response.text
-    except Exception as e:
-        logger.error(f"Gemini API Error: {e}")
-        ai_response = "माफ़ कीजिए, अभी AI जवाब देने में असमर्थ है। कृपया थोड़ी देर बाद प्रयास करें।"
+                logger.error(f"Groq API Error: {e}")
+    
+    # Fallback to free HuggingFace Inference API (no key needed)
+    if not ai_response:
+        try:
+            hf_resp = requests.post(
+                "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "inputs": f"<s>[INST] {system_prompt}\n\nUser: {message or 'Analyze this.'} [/INST]",
+                    "parameters": {"max_new_tokens": 400, "temperature": 0.7}
+                },
+                timeout=30
+            )
+            if hf_resp.status_code == 200:
+                hf_data = hf_resp.json()
+                if isinstance(hf_data, list) and len(hf_data) > 0:
+                    generated = hf_data[0].get('generated_text', '')
+                    # Extract only the response after [/INST]
+                    if '[/INST]' in generated:
+                        ai_response = generated.split('[/INST]')[-1].strip()
+                    else:
+                        ai_response = generated.strip()
+                    logger.info("Chatbot response via HuggingFace API")
+        except Exception as e:
+            logger.error(f"HuggingFace API Error: {e}")
+    
+    if not ai_response:
+        ai_response = "माफ़ कीजिए, अभी AI जवाब देने में असमर्थ है। कृपया .env में GEMINI_API_KEY या GROQ_API_KEY सेट करें।"
         
     bot_msg = ChatMessage(session_id=chat_session.id, role='bot', content=ai_response)
     db.session.add(bot_msg)
@@ -327,6 +612,86 @@ def chatbot_clear():
             db.session.commit()
     return jsonify({'status': 'success'})
 
+@app.route('/voice/query', methods=['POST'])
+@login_required
+def voice_query():
+    data = request.get_json() or {}
+    query = data.get('query', '').strip()
+    
+    if not query:
+        return jsonify({'response': "कृपया अपना सवाल पूछें।"})
+    
+    system_prompt = "You are an agricultural voice assistant for Indian farmers. You were created by the 'Quanta Byte' team. If anyone asks who created you, who made you, or anything similar (like 'tumhe kisne banaya hai'), you must reply that you were created by the Quanta Byte team. Provide a direct, helpful, and concise spoken answer (1-2 sentences max) in the exact language requested (mostly Hindi or English). Do not use any markdown, bullet points, or special formatting since this will be read aloud by text-to-speech."
+    ai_response = None
+    
+    # Try Gemini first
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key and gemini_key != "your_gemini_api_key_here" and HAS_GENAI:
+        try:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            prompt = f"{system_prompt}\nQuestion: {query}"
+            response = model.generate_content(prompt)
+            ai_response = response.text
+        except Exception as e:
+            logger.error(f"Voice Gemini API Error: {e}")
+    
+    # Fallback to Groq API
+    if not ai_response:
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+        if groq_key and groq_key != "your_groq_api_key_here":
+            try:
+                groq_resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {groq_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": query}
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 200
+                    },
+                    timeout=30
+                )
+                if groq_resp.status_code == 200:
+                    groq_data = groq_resp.json()
+                    ai_response = groq_data['choices'][0]['message']['content']
+            except Exception as e:
+                logger.error(f"Voice Groq API Error: {e}")
+    
+    # Fallback to HuggingFace
+    if not ai_response:
+        try:
+            hf_resp = requests.post(
+                "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "inputs": f"<s>[INST] {system_prompt}\n\nUser: {query} [/INST]",
+                    "parameters": {"max_new_tokens": 200, "temperature": 0.7}
+                },
+                timeout=30
+            )
+            if hf_resp.status_code == 200:
+                hf_data = hf_resp.json()
+                if isinstance(hf_data, list) and len(hf_data) > 0:
+                    generated = hf_data[0].get('generated_text', '')
+                    if '[/INST]' in generated:
+                        ai_response = generated.split('[/INST]')[-1].strip()
+                    else:
+                        ai_response = generated.strip()
+        except Exception as e:
+            logger.error(f"Voice HuggingFace API Error: {e}")
+    
+    if not ai_response:
+        ai_response = "माफ़ कीजिए, अभी नेटवर्क त्रुटि हुई। कृपया .env में API key सेट करें।"
+        
+    return jsonify({'response': ai_response.strip()})
+
 @app.route('/voice')
 @login_required
 def voice():
@@ -339,11 +704,124 @@ def machinery():
     logger.info("Accessed Machinery page")
     return render_template('machinery.html')
 
+@app.route('/api/market/live')
+def api_market_live():
+    district = request.args.get('district', '').strip()
+    commodity = request.args.get('commodity', '').strip()
+    
+    api_key = os.environ.get("DATA_GOV_API_KEY")
+    if not api_key:
+        return jsonify({"message": "API key not configured", "records": []}), 500
+        
+    resource_id = "9ef84268-d588-465a-a308-a864a43d0070"
+    url = f"https://api.data.gov.in/resource/{resource_id}"
+    
+    params = {
+        "api-key": api_key,
+        "format": "json",
+        "limit": 50,
+    }
+    if district:
+        params["filters[district]"] = district
+    if commodity:
+        params["filters[commodity]"] = commodity
+        
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            records = data.get("records", [])
+            formatted_records = []
+            for rec in records:
+                try:
+                    min_p = float(rec.get("min_price", 0))
+                    max_p = float(rec.get("max_price", 0))
+                    modal = float(rec.get("modal_price", 0))
+                except:
+                    min_p, max_p, modal = 0, 0, 0
+                
+                formatted_records.append({
+                    "crop_name": rec.get("commodity", ""),
+                    "district": rec.get("district", ""),
+                    "market": rec.get("market", ""),
+                    "state": rec.get("state", ""),
+                    "min_price": min_p,
+                    "max_price": max_p,
+                    "modal_price": modal,
+                    "arrival_date": rec.get("arrival_date", ""),
+                    "variety": rec.get("variety", ""),
+                    "unit": "Quintal"
+                })
+            
+            return jsonify({
+                "message": "",
+                "source": "data.gov.in (Agmarknet)",
+                "records": formatted_records
+            })
+        else:
+            return jsonify({"message": "Failed to fetch from data.gov.in", "records": []}), 500
+    except Exception as e:
+        return jsonify({"message": str(e), "records": []}), 500
+
+
 @app.route('/market')
 @login_required
 def market():
     logger.info("Accessed Market page")
-    return render_template('market.html')
+    crop = request.args.get('crop', '').strip()
+    state = request.args.get('state', '').strip()
+    
+    api_key = os.environ.get("DATA_GOV_API_KEY")
+    prices = []
+    last_updated = datetime.now().strftime("%I:%M %p")
+    
+    if api_key:
+        resource_id = "9ef84268-d588-465a-a308-a864a43d0070"
+        url = f"https://api.data.gov.in/resource/{resource_id}"
+        
+        params = {
+            "api-key": api_key,
+            "format": "json",
+            "limit": 20,
+        }
+        if state:
+            params["filters[state]"] = state
+        if crop:
+            params["filters[commodity]"] = crop
+            
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                records = data.get("records", [])
+                for rec in records:
+                    try:
+                        min_p = float(rec.get("min_price", 0))
+                        max_p = float(rec.get("max_price", 0))
+                        modal = float(rec.get("modal_price", 0))
+                    except:
+                        min_p, max_p, modal = 0, 0, 0
+                        
+                    prices.append({
+                        "name": rec.get("commodity", crop or "Fasal"),
+                        "emoji": "🌾", 
+                        "market": rec.get("market", "N/A"),
+                        "state": rec.get("state", ""),
+                        "price": modal,
+                        "min_price": min_p,
+                        "max_price": max_p,
+                        "msp": 0,
+                        "change": 0,
+                        "is_best": False
+                    })
+        except Exception as e:
+            logger.error(f"Error fetching market prices: {e}")
+            flash('Error fetching market prices. Please try again.', 'danger')
+    else:
+        # If no API key, you could flash a warning
+        pass
+
+    return render_template('market.html', prices=prices, last_updated=last_updated)
 
 @app.route('/profile', methods=['GET', 'POST'])
 @login_required
@@ -421,9 +899,52 @@ def yield_page():
     logger.info("Accessed Yield page")
     return render_template('yield.html')
 
-# ==========================================
+@app.route('/pest', methods=['GET', 'POST'])
+@login_required
+def pest():
+    logger.info("Accessed Pest Detection page")
+    result = None
+    if request.method == 'POST':
+        crop = request.form.get('crop', '')
+        symptoms = request.form.get('symptoms', '')
+        image_file = request.files.get('image')
+        
+        if not image_file or image_file.filename == '':
+            flash('Please upload an image.', 'danger')
+            return redirect(request.url)
+            
+        filename = secure_filename(f"{uuid.uuid4().hex}_{image_file.filename}")
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        image_file.save(filepath)
+        
+        try:
+            is_valid, error_msg = validate_image_for_mode(filepath, mode='pest')
+            if not is_valid:
+                os.remove(filepath)
+                flash(error_msg, 'danger')
+                return redirect(request.url)
+                
+            result = predict_pest(filepath, user_crop="")
+            if "error" in result:
+                os.remove(filepath)
+                flash(result["error"], 'danger')
+                result = None
+            else:
+                result['uploaded_image_url'] = url_for('static', filename=f'uploads/ai_images/{filename}')
+        except Exception as e:
+            if os.path.exists(filepath): os.remove(filepath)
+            flash(f"Error processing image: {e}", 'danger')
+            result = None
+                
+    return render_template('pest.html', result=result)
+
+@app.route('/organic')
+@login_required
+def organic():
+    logger.info("Accessed Organic Farming page")
+    return render_template('organic.html')
+
 # App Execution
-# ==========================================
 if __name__ == '__main__':
     logger.info("Starting the Flask application...")
     # Running in debug mode for development; should be False in production

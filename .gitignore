@@ -3,3 +3,8 @@ __pycache__/
 instance/
 .env
 .DS_Store
+
+# Dependencies and built files
+venv/
+node_modules/
+.next/
