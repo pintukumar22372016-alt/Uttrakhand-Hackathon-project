@@ -51,10 +51,6 @@ async def voice_query(
             
             contents = [
                 types.Content(
-                    role="system",
-                    parts=[types.Part.from_text(text=VOICE_SYSTEM_INSTRUCTION)]
-                ),
-                types.Content(
                     role="user",
                     parts=[types.Part.from_text(text=req.query)]
                 )
@@ -62,7 +58,10 @@ async def voice_query(
             
             response = client.models.generate_content(
                 model='gemini-1.5-flash',
-                contents=contents
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=VOICE_SYSTEM_INSTRUCTION
+                )
             )
             
             reply = response.text.strip()

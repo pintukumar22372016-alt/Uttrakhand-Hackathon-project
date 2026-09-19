@@ -56,14 +56,16 @@ async def chat_query(
             
             client = genai.Client(api_key=settings.GEMINI_API_KEY)
             
+            # Intercept identity query
+            req_msg_lower = req.message.lower()
+            identity_keywords = ["tumhe kaun banaya", "kisne banaya", "who made you", "who created you", "who developed you", "who built you", "who are you made by", "who is your creator", "who made this chatbot", "who developed this ai"]
+            if any(k in req_msg_lower for k in identity_keywords):
+                bot_reply = "I was developed by the Quanta Byte Team."
+                await crud.create_chat_message(db, req.session_id, "bot", bot_reply, user_id)
+                return {"response": bot_reply}
+
             # Format chat history for Gemini API
             contents = []
-            
-            # System instruction
-            contents.append(types.Content(
-                role="system",
-                parts=[types.Part.from_text(text=CHAT_SYSTEM_INSTRUCTION)]
-            ))
             
             # Prior dialogue context
             for msg in history[:-1]: # exclude the user message we just saved since we add it below
@@ -80,7 +82,10 @@ async def chat_query(
             
             response = client.models.generate_content(
                 model='gemini-1.5-flash',
-                contents=contents
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=CHAT_SYSTEM_INSTRUCTION
+                )
             )
             
             bot_reply = response.text
