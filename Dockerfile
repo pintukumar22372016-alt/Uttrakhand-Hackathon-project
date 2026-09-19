@@ -1,0 +1,47 @@
+FROM node:20-alpine AS frontend-build
+WORKDIR /app/frontend
+COPY frontend/package*.json ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+FROM python:3.11-slim
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    nginx \
+    supervisor \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libpq-dev \
+    gcc \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Flask dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install FastAPI dependencies
+COPY backend/requirements.txt ./backend_reqs.txt
+RUN pip install --no-cache-dir -r backend_reqs.txt
+
+# Copy application files
+COPY . .
+
+# Copy built Next.js
+COPY --from=frontend-build /app/frontend/.next ./frontend/.next
+COPY --from=frontend-build /app/frontend/node_modules ./frontend/node_modules
+
+# Setup configurations
+COPY deploy/nginx.conf /etc/nginx/sites-available/default
+COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Setup env variables for Next.js to reach FastAPI during runtime
+ENV NEXT_PUBLIC_API_URL=/api
+
+EXPOSE 80
+CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
